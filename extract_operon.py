@@ -5,6 +5,12 @@ import argparse
 import pandas as pd
 from Bio import SeqIO
 
+# What this does: 
+#  -  Generates fasta files (faa/fna/faa+fna) based on gene(s) of interest
+#  -  Takes input from an individual locus tag or a batch list of locus tags
+#  -  By default it extracts entire operons, but --mode gene pulls isolated genes
+
+# How to use it:
 # First things first, make sure it's executable:
 #   chmod +x extract_operon.py
 # 1) Extract operon from single gene (default pulls entire operon, both .ffn and .faa):
@@ -15,7 +21,6 @@ from Bio import SeqIO
 #   ./extract_operon.py PBUTOS_00001 --mode gene
 # 4) Other options:
 #   --type [both/aa/na]; for selectioning output options
-#
 
 # File paths
 CSV_PATH = "/mnt/work-drive/kira/peri-final-genomes/operons.csv"
