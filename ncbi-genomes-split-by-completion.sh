@@ -1,44 +1,48 @@
 #!/bin/bash
-#command to run: source download-and-split.sh
+# command to run: source download-and-split.sh
 set -e
 
 conda activate ncbi-data
 
-for dir in ./*/ ;
-do
-cd "$dir"
+for dir in ./*/ ; do
+    # skip if it's not actually a directory
+    [ -d "$dir" ] || continue
+    
+    cd "$dir"
 
-datasets download genome accession --inputfile related.txt --include cds,gbff,genome,gff3,gtf,protein,rna,seq-report
+    # download datasets
+    datasets download genome accession --inputfile related.txt --include cds,gbff,genome,gff3,gtf,protein,rna,seq-report
 
-unzip ncbi_dataset.zip
-mv ncbi_dataset/data ./ncbi
-rm -rf ncbi_dataset 
-rm ncbi_dataset.zip
-mkdir fna fna-complete fna-incomplete
+    # unzip and clean up
+    unzip -q ncbi_dataset.zip
+    mv ncbi_dataset/data ./ncbi
+    rm -rf ncbi_dataset ncbi_dataset.zip
+    
+    # create output folders
+    mkdir -p fna fna-complete fna-incomplete
 
-#copy genomic fnas to a single folder
+    # copy genomic fnas to a single folder
+    cp ncbi/*/G*.fna fna/ 2>/dev/null || true
 
-cp ncbi/*/G*.fna fna/
+    # count contigs and log them
+    for f in fna/*.fna; do
+        [ -f "$f" ] || continue
+        basename "$f" >> out.txt
+        grep -c '>' "$f" >> out.txt
+    done
 
-#output the number of contigs in each file
+    # Separate complete from incomplete genomes
+    for f in fna/*.fna ; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f" .fna)
+        
+        if grep -q "complete genome" "$f"; then
+            cp "$f" fna-complete/"$base".fna
+        else
+            cp "$f" fna-incomplete/"$base".fna
+        fi
+    done
 
-for f in fna/*.fna
-do
-awk '{cmd=sprintf("basename %s",FILENAME);cmd | getline out; print FILENAME,out; exit}' "$f"
-grep -o '>' "$f" | wc -l
-done >>out.txt
-
-#copy files with less than 7 contigs to a complete folder and the rest to incomplete
-for f in fna/*.fna ;
-do
-base=$(basename "$f" .fna)
-if [ "$( grep -c "complete genome" "$f" )" -gt 0 ]
-then
-cp "$f" fna-complete/"$base".fna
-else
-cp "$f" fna-incomplete/"$base".fna
-fi
-done
-
-cd ..
+    # back up to parent directory
+    cd ..
 done
