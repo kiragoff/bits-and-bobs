@@ -1,0 +1,442 @@
+---
+title: "Dynamic Bubble Plots"
+author: "Kira Goff"
+date: "2026-07-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r clear-workspace}
+rm(list = ls(all = TRUE))
+```
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(ggtext)
+library(paletteer)
+```
+
+
+
+```{r load-data}
+# csv files as a list - can take one or more. should have standard taxonomy columns
+# and then samples with whole numbers
+file_paths <- c(
+  "/mnt/work-drive/kira/nanopore16s/run1/final_clean_taxa_table.csv",
+  "/mnt/work-drive/kira/nanopore16s/run2/final_clean_taxa_table.csv"
+)
+
+# read and merge dynamically 
+data_list <- lapply(file_paths, read.csv)
+
+# you might have to change these column names based on the database you used, look at your files
+tax_cols <- c("OTU", # change this if your equivalent column is named anything else
+              "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species") 
+common_cols <- Reduce(intersect, lapply(data_list, colnames))
+join_cols <- intersect(tax_cols, common_cols)
+
+if (length(data_list) == 1) {
+  combined_data <- data_list[[1]]
+} else {
+  combined_data <- Reduce(function(x, y) {
+    full_join(x, y, by = join_cols, relationship = "many-to-many")
+  }, data_list)
+}
+
+# Fix NAs in counts/abundance columns
+combined_data <- combined_data %>%
+  mutate(across(where(is.numeric), ~replace_na(., 0)))
+
+sample_cols <- colnames(combined_data)[sapply(combined_data, is.numeric)]
+```
+
+# fixy fixy
+
+```{r taxa-filtering-and-collapse}
+# --- BIOLOGICAL FILTERS & TAXONOMY OPTIONS ---
+target_tax_level       <- "Genus"     # Phylum, Class, Order, Family, Genus
+top_n_taxa             <- 25          # top n taxa
+bubble_thresh          <- 0.001       # don't plot bubbles below x % relative abundance
+filter_strategy        <- "sample"    # are the top n in all samples ("global") or for each sample ("sample")?
+use_relative_abundance <- TRUE        # for absolute numbers, use FALSE
+within_phylum_sort     <- "abundance" # "abundance", "alphabet", "occupancy" (sort by presence/absence)
+
+# --- NEW SORTING OPTION ---
+group_by_phylum        <- TRUE # TRUE (sort WITHIN phyla), FALSE (sort across all taxa)
+# if group_by_phylum is FALSE, you must ALSO set facet_by_phylumn to FALSE
+
+# --- UNCLASSIFIED TAXA CONTROLS ---
+# Options: 
+#   "parent_failed" -> e.g., "Bacilli Order" or "Lactobacillaceae Genus" 
+#   "unclass_of"    -> e.g., "Unclassified Genus of Lactobacillaceae" 
+#   "prefix"        -> e.g., "Uncl. Lactobacillaceae"
+#   "suffix"        -> e.g., "Lactobacillaceae uncl."
+#   "clean"         -> e.g., "Lactobacillaceae"
+uncl_style             <- "parent_failed"      
+fallback_label         <- "Unknown Bacteria" 
+
+# --- OPTIONAL: METADATA SAMPLE SORTING ---
+use_metadata_sort   <- FALSE              # TRUE to sort X-axis by metadata, FALSE to keep default
+#metadata_file     <- "/mnt/work-drive/kira/rproj-rnaseq/results2/testmeta.csv"    # Path to your metadata file
+#metadata_sample_col <- "Sample"        # Column in metadata matching your CSV column headers
+#metadata_sort_col   <- "Order"       # Column in metadata you want to sort samples by (e.g., "Day", "Group")
+
+# If not using, and you don't have a metadata file
+# hash out metadata_file through metadata_sort_col
+# so it stops freaking out when it fails to find a file you don't need
+# -----
+
+# --- INITIALIZE COLS TO PLOT ---
+# We make a copy of sample_cols here. If metadata sorting is off, plot_cols remains untouched 
+plot_cols <- sample_cols 
+
+# Validate metadata selection immediately if active
+if (use_metadata_sort) {
+  if (!exists("metadata_file") || !file.exists(metadata_file)) {
+    stop("Metadata file is either missing or you forgot to comment it back on")
+  }
+  if (!exists("metadata_sample_col") || !exists("metadata_sort_col")) {
+    stop("You forgot to turn the metadata columns off.")
+  }
+  
+  # Load metadata (auto-detects tab vs comma)
+  meta_df <- read.table(metadata_file, header = TRUE, 
+                        sep = ifelse(grepl("\\.tsv$\vert{}\\.txt$", tolower(metadata_file)), "\t", ","), 
+                        stringsAsFactors = FALSE)
+  
+  if (!metadata_sample_col %in% colnames(meta_df)) {
+    stop(metadata_sample_col, "' is not in the metadata file.")
+  }
+  if (!metadata_sort_col %in% colnames(meta_df)) {
+    stop("Sort column '", metadata_sort_col, "' does not exist in the metadata file.")
+  }
+  
+  # Extract sorted sample order from metadata
+  ordered_samples <- meta_df %>%
+    arrange(.data[[metadata_sort_col]]) %>%
+    pull(.data[[metadata_sample_col]])
+  
+  # Keep only samples that actually exist in our raw data's sample_cols
+  ordered_samples <- ordered_samples[ordered_samples %in% sample_cols]
+  
+  if (length(ordered_samples) == 0) {
+    stop("Ooops, there are no samples names in your metadata that match your dataframe.")
+  }
+  
+  # Append any dataset columns that were missing from metadata
+  missing_samples <- setdiff(sample_cols, ordered_samples)
+  if (length(missing_samples) > 0) {
+    warning("Note: ", length(missing_samples), " sample(s) were missing from metadata. Appending to end.")
+    ordered_samples <- c(ordered_samples, missing_samples)
+  }
+  
+  # Save the finalized order
+  plot_cols <- ordered_samples
+}
+
+# --- FIX UNCLASSIFIED TAXONOMY ---
+rescue_taxonomy <- function(df, level, style = "parent_failed", fallback = "Unknown Bacteria") {
+  levels_order <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  target_idx <- which(levels_order == level)
+  
+  tax_matrix <- as.matrix(df[, levels_order[1:target_idx], drop = FALSE])
+  clean_labels <- character(nrow(df))
+  
+  for (r in 1:nrow(df)) {
+    current_val <- tax_matrix[r, target_idx]
+    
+    if (is.na(current_val) || current_val == "" || str_detect(tolower(current_val), "unclassified")) {
+      
+      # 1. Find the FIRST level that failed (moving left-to-right)
+      first_unclass_idx <- NA
+      for (c in 1:target_idx) {
+        val <- tax_matrix[r, c]
+        if (is.na(val) || val == "" || str_detect(tolower(val), "unclassified")) {
+          first_unclass_idx <- c
+          break
+        }
+      }
+      
+      # 2. Grab last known parent
+      resolved_name <- fallback
+      if (!is.na(first_unclass_idx) && first_unclass_idx > 1) {
+        for (p_idx in (first_unclass_idx - 1):1) {
+          parent_val <- tax_matrix[r, p_idx]
+          if (!is.na(parent_val) && parent_val != "" && !str_detect(tolower(parent_val), "unclassified")) {
+            
+            failed_level_name <- levels_order[first_unclass_idx]
+            
+            resolved_name <- switch(style,
+              "parent_failed" = paste(parent_val, failed_level_name),
+              "unclass_of"    = paste("Unclassified", failed_level_name, "of", parent_val), 
+              "suffix"        = paste(parent_val, "uncl."),
+              "prefix"        = paste("Uncl.", parent_val),
+              "clean"         = parent_val,
+              paste(parent_val, "uncl.") 
+            )
+            break
+          }
+        }
+      }
+      clean_labels[r] <- resolved_name
+    } else {
+      if (level %in% c("Genus", "Species")) {
+        clean_labels[r] <- paste0("*", current_val, "*")
+      } else {
+        clean_labels[r] <- current_val
+      }
+    }
+  }
+  df$Clean_Tax_Label <- clean_labels
+  return(df)
+}
+
+processed_data <- rescue_taxonomy(
+  combined_data, 
+  level = target_tax_level, 
+  style = uncl_style, 
+  fallback = fallback_label
+)
+
+# Collapse duplicates (use plot_cols to keep columns safe)
+collapsed_data <- processed_data %>%
+  group_by(Phylum, Clean_Tax_Label) %>%
+  summarise(across(all_of(plot_cols), sum), .groups = 'drop')
+
+# convert to % if relative abundance toggled
+if (use_relative_abundance) {
+  collapsed_data <- collapsed_data %>%
+    mutate(across(all_of(plot_cols), ~ (. / sum(.)) * 100))
+  abundance_measure_text <- "Relative Abundance (%)"
+  abundance_file_stamp   <- "relative"
+} else {
+  collapsed_data <- collapsed_data %>%
+    mutate(across(all_of(plot_cols), ~ .))
+  abundance_measure_text <- "Raw Read Count"
+  abundance_file_stamp   <- "absolute"
+}
+
+# filter to top X taxa
+if (filter_strategy == "global") {
+  bubble_filtered <- collapsed_data %>%
+    mutate(Total_Abundance = rowSums(across(all_of(plot_cols)))) %>%
+    arrange(desc(Total_Abundance)) %>%
+    slice_head(n = top_n_taxa) %>%
+    pivot_longer(cols = all_of(plot_cols), names_to = "Sample", values_to = "Abundance")
+} else {
+  bubble_filtered <- collapsed_data %>%
+    pivot_longer(cols = all_of(plot_cols), names_to = "Sample", values_to = "Abundance") %>%
+    group_by(Sample) %>%
+    slice_max(order_by = Abundance, n = top_n_taxa, with_ties = FALSE) %>%
+    ungroup()
+}
+
+bubble_plot_data <- bubble_filtered %>% filter(Abundance > bubble_thresh)
+
+# Handle phylum sorting
+bubble_plot_data <- bubble_plot_data %>%
+  group_by(Phylum) %>%
+  mutate(Phylum_Total = sum(Abundance)) %>%
+  group_by(Phylum, Clean_Tax_Label) %>%
+  mutate(Taxon_Total = sum(Abundance),
+         Taxon_Occupancy = sum(Abundance > 0)) %>%
+  ungroup()
+
+# Sort dataframe 
+# Determine sort hierarchy based on whether we are grouping by phylum
+if (group_by_phylum) {
+  # Sorts within Phyla first 
+  if (within_phylum_sort == "abundance") {
+    bubble_plot_data <- bubble_plot_data %>% arrange(desc(Phylum_Total), desc(Taxon_Total))
+  } else if (within_phylum_sort == "alphabet") {
+    bubble_plot_data <- bubble_plot_data %>% arrange(Phylum, Clean_Tax_Label)
+  } else if (within_phylum_sort == "occupancy") {
+    bubble_plot_data <- bubble_plot_data %>% arrange(desc(Phylum_Total), desc(Taxon_Occupancy))
+  }
+} else {
+  # Sorts globally by individual taxon abundance, ignoring phylum boundaries
+  bubble_plot_data <- bubble_plot_data %>% arrange(desc(Taxon_Total))
+}
+
+# Extract factors in sorted order
+ordered_phyla <- unique(bubble_plot_data$Phylum)
+y_levels      <- rev(unique(bubble_plot_data$Clean_Tax_Label))
+
+# Apply the factors safely
+bubble_plot_data <- bubble_plot_data %>%
+  mutate(
+    Phylum = factor(Phylum, levels = ordered_phyla),
+    Clean_Tax_Label = factor(Clean_Tax_Label, levels = y_levels)
+  )
+
+# Set the factor level order for the Sample column to match plot_cols order exactly
+bubble_plot_data <- bubble_plot_data %>%
+  mutate(Sample = factor(Sample, levels = plot_cols))
+```
+
+Some palettes that support a larger number of colours:
+    pals::polychrome (Up to 36 colors): Built specifically dozens of categories
+    pals::alphabet (Up to 26 colors): Highly distinct, contrasting colors
+    pals::kelly (Up to 22 colors): Maximize contrast; excellent for making individual bubbles pop
+    ggsci::ucscgb_pal (Up to 26 colors)
+    ggsci::d3_category20 (20 colors)
+
+But remember, we're colour coding by phyla, so you don't need as many as you might think
+Paletteer gallery: https://pmassicotte.github.io/paletteer_gallery/#discrete-palettes
+Palette finder: https://r-graph-gallery.com/color-palette-finder.html 
+
+```{r data-visualization-and-save}
+# ----- VISUALIZATION OPTIONS -----
+phylum_palette         <- "ggthemes::Tableau_20" # palette for paletteer 
+plot_width             <- 11            
+plot_height            <- 15            
+
+facet_by_phylum        <- TRUE          # must be FALSE if group_by_phylum is FALSE
+show_abundance_labels  <- FALSE          # do you want the % relative abundance printed on each bubble
+legend_position        <- "right"        # "none", "bottom", "right"
+bubble_max             <- 400           # adjust up for generally larger bubbles, down if overlapping
+
+# ----------------------------------
+
+# --- DYNAMIC BUBBLE SIZING ---
+num_taxa    <- length(unique(bubble_plot_data$Clean_Tax_Label))
+num_samples <- length(unique(bubble_plot_data$Sample))
+
+# Shrink maximum bubble size as the grid gets more crowded
+bubble_min_size <- max(1.5, min(4, 30 / num_taxa))
+bubble_max_size <- max(4, min(18, bubble_max / num_taxa))
+
+palette_clean_name <- str_replace(phylum_palette, "::", "_")
+
+# --- THE PLOT THICKENS ---
+
+# ggplot base
+p <- ggplot(bubble_plot_data, aes(x = Sample, y = Clean_Tax_Label, size = Abundance, color = Phylum)) +
+  geom_point(alpha = 0.85) +
+  scale_size_continuous(range = c(bubble_min_size, bubble_max_size), name = abundance_measure_text) +
+  scale_color_paletteer_d(phylum_palette, name = "Phylum")
+
+if (show_abundance_labels) {
+  p <- p + geom_text(
+    aes(label = if(use_relative_abundance) paste0(round(Abundance, 1), "%") else round(Abundance, 0)),
+    color = "black",
+    size = 3.0,
+    fontface = "bold",
+    show.legend = FALSE
+  )
+}
+
+if (facet_by_phylum) {
+  p <- p + 
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 11, face = "bold"),
+      # Target both general and specific left y-axis elements
+      axis.text.y = ggtext::element_markdown(size = 10),
+      axis.text.y.left = ggtext::element_markdown(size = 10),
+      strip.text.y = element_text(angle = 0, face = "bold", size = 9),
+      strip.background = element_rect(fill = "gray95"),
+      panel.grid.major = element_line(color = "gray95", linewidth = 0.5)
+    ) +
+    labs(x = "Samples", y = "") +
+    facet_grid(Phylum ~ ., scales = "free_y", space = "free_y")
+  
+  layout_type <- "boxed"
+} else {
+  p <- p + 
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 11, face = "bold"),
+      # Target both general and specific left y-axis elements to force-override theme_minimal
+      axis.text.y = ggtext::element_markdown(size = 10), 
+      axis.text.y.left = ggtext::element_markdown(size = 10), 
+      axis.title = element_text(size = 12, face = "bold"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.x = element_line(color = "gray95", linewidth = 0.5),
+      panel.border = element_rect(color = "gray80", fill = NA, linewidth = 1)
+    ) +
+    labs(
+      x = "Samples",
+      y = paste("Bacterial", target_tax_level),
+      title = paste(target_tax_level, "Level Profile"),
+      subtitle = paste("Sorted by:", within_phylum_sort)
+    )
+  
+  layout_type <- "flat"
+}
+
+# Legend settings
+if (legend_position == "none") {
+  p <- p + theme(legend.position = "none")
+} else if (legend_position == "bottom") {
+  p <- p + 
+    guides(
+      color = "none", 
+      size = guide_legend(direction = "horizontal", title.position = "top", title.hjust = 0.5)
+    ) +
+    theme(
+      legend.position = "bottom",
+      legend.background = element_blank(),
+      legend.key = element_blank()
+    )
+} else if (legend_position == "right") {
+  p <- p + theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold")
+  )
+}
+
+print(p)
+
+# --- DYNAMIC EXPORT ---
+
+# Capture date in YYYYMMDD format
+date_stamp <- format(Sys.Date(), "%Y%m%d")
+
+# replace variables with something that will make sense in the future
+layout_label  <- if (facet_by_phylum) "boxed" else "flat"
+label_suffix  <- if (show_abundance_labels) "_withLabels" else ""
+tax_sorting_label <- if (group_by_phylum) "byPhylum" else "globalSort" # y sort
+
+# append "_sortBy[Column]" if metadata sorting is used
+sample_sorting_suffix <- if (use_metadata_sort && exists("metadata_sort_col")) {
+  paste0("_sortBy", metadata_sort_col)
+} else {
+  ""
+}
+
+# Assemble file name
+output_filename <- paste0(
+  "bubbleplot_",
+  layout_label, "_",
+  target_tax_level, "_",
+  tax_sorting_label, 
+  sample_sorting_suffix, "_",  # Appends metadata sort info right after tax sort
+  filter_strategy, "_",
+  "top", top_n_taxa, "_",
+  abundance_file_stamp,
+  label_suffix, "_",
+  date_stamp, ".png"
+)
+
+# Save plot
+ggsave(
+  filename = output_filename, 
+  plot     = p, 
+  width    = plot_width, 
+  height   = plot_height, 
+  dpi      = 300
+)
+
+# Success message
+message("Huzzah! Plot saved as: ", output_filename)
+```
